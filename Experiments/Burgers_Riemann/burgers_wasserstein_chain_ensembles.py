@@ -1,0 +1,627 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+from functools import partial
+from scipy.stats import norm
+
+import sys
+sys.path.append("../../")
+
+from ip_mcmc import (EnsembleManager,
+                     MCMCSampler,
+                     pCNAccepter,
+                     StandardRWAccepter,
+                     ConstrainAccepter,
+                     CountedAccepter,
+                     ConstSteppCNProposer,
+                     EvolutionPotential,
+                     GaussianDistribution,
+                     ConstStepStandardRWProposer,
+                     VarStepStandardRWProposer)
+
+
+sys.path.append("../Burgers_Riemann")
+from utilities import (FVMObservationOperator,
+                                          PerturbedRiemannIC,
+                                          RusanovMCMC,
+                                          Measurer,
+                                          store_figure,
+                                          load_or_compute,
+                                          BurgersEquation,
+                                          autocorrelation,
+                                          wasserstein_distance,
+                                          DATA_DIR)
+
+
+def export_to_tikz_array(name, x, y):
+    """Export in tikz usable format
+    Overwrite existing files"""
+    x, y = (np.asarray(x), np.asarray(y))
+    assert len(x.shape) == 1, ""
+    assert len(y.shape) == 1, ""
+    assert x.size == y.size, ""
+
+    with open(DATA_DIR + name + ".tikz.txt", "w") as f:
+        for x_, y_ in zip(x, y):
+            print(x_, y_, file=f)
+
+
+def hist_export_to_tikz_array(name, vals):
+    bins, binsize = np.linspace(-0.576, 0.576, num=24, retstep=True)
+    hist, _ = np.histogram(vals, bins=bins, density=True)
+
+    # give center of bins
+    x = np.array([left_edge + binsize/2 for left_edge in bins[:-1]])
+    export_to_tikz_array(name, x, hist)
+
+
+def mean_MAP_plot(name, samples):
+    # extract mean
+    mean = np.mean(samples, axis=1)
+    print(f"mean={mean}")
+
+    # extract MAP
+    MAP = np.zeros_like(mean)
+    for i in range(MAP.shape[0]):
+        histvals, bins = np.histogram(samples[i, :], bins=1000)
+        MAP[i] = (bins[np.argmax(histvals)] + bins[np.argmax(histvals) + 1]) / 2
+    print(f"MAP={MAP}")
+
+    # run FVM with those point as input
+    integrator = create_integrator()
+    mean_endstate = integrator(PerturbedRiemannIC(mean),PerturbedTransportFlux(mean))
+    MAP_endstate = integrator(PerturbedRiemannIC(MAP),PerturbedTransportFlux(MAP))
+
+    # export to tikz
+    x_vals = Settings.Simulation.get_xvals()
+    export_to_tikz_array(name + "_mean", x_vals, mean_endstate)
+    export_to_tikz_array(name + "_MAP", x_vals, MAP_endstate)
+
+
+class PWLinear:
+    """linearly decrease delta until burn_in is finished, then keep it constant"""
+    def __init__(self, start_delta, end_delta, len_burn_in):
+        self.d_s = start_delta
+        self.d_e = end_delta
+        self.l = len_burn_in
+
+        self.slope = (start_delta - end_delta) / len_burn_in
+
+    def __call__(self, i):
+        if i > self.l:
+            return self.d_e
+        return self.d_s - self.slope * i
+
+    def __repr__(self):
+        """For filename"""
+        return f"pwl_{self.d_s}_{self.d_e}_{self.l}"
+
+
+def is_valid_IC(u):
+    """Return True if u is a valid initial condition.
+    Namely it returns False if the initial shock location is
+    outside of the domain.
+    """
+    return True
+    # s = u[2] + Settings.Prior.mean[2]
+    # eps = 0.1
+    # return (s > Settings.Simulation.domain[0] + eps and
+    #         s < Settings.Simulation.domain[1] - eps)
+
+
+class Settings:
+    """'Static' class to collect the settings for a MCMC simulation"""
+    # 'Attributes' that derive from other attributes need to be implemented
+    # using a getter-method, so that they get updated when the thing
+    # they depend on changes.
+    class Simulation:
+        class IC:
+            names = ["delta_1", "delta_2", "sigma"]
+            delta_1 = 0.
+            delta_2 = 0.
+            sigma = 0.
+            ground_truth = np.array([delta_1, delta_2, sigma])
+
+        domain = (-1.,1.)
+        N_gridpoints = 128
+        T_end = 1.
+
+        flux = BurgersEquation.flux
+        flux_prime = BurgersEquation.flux_prime
+
+        # cfl = 0.4
+
+        @staticmethod
+        def get_xvals():
+            return RusanovMCMC(None, None,
+                        Settings.Simulation.domain,
+                        Settings.Simulation.N_gridpoints,
+                        0).FVM.x[1:-1]
+
+    class Measurement:
+        points = [-0.5, -0.25, 0.35, 0.5, 0.65]
+        interval = 0.1
+
+    class Noise:
+        mean = np.array([0] * 5)
+        std_dev = 0.05
+        covariance = std_dev**2 * np.identity(len(mean))
+
+        @staticmethod
+        def get_distribution():
+            return GaussianDistribution(Settings.Noise.mean,
+                                        Settings.Noise.covariance)
+
+    class Prior:
+        mean = np.array([0.1, -0.1, -0.1])  # delta
+        std_dev = 0.15
+        covariance = std_dev**2 * np.identity(len(mean))
+
+        @staticmethod
+        def get_distribution():
+            return GaussianDistribution(Settings.Prior.mean,
+                                        Settings.Prior.covariance)
+
+    class Sampling:
+        step = PWLinear(0.05, 0.001, 250)
+        u_0 = np.zeros(3)
+        N = 2500
+        burn_in = 500
+        sample_interval = 20
+        rng = np.random.default_rng(2)
+
+    @staticmethod
+    def filename():
+        return f"burgersflux_EP_n={Settings.Sampling.N}_h={Settings.Simulation.N_gridpoints}"
+
+
+def create_integrator():
+    return RusanovMCMC(Settings.Simulation.flux,
+                Settings.Simulation.flux_prime,
+                # Settings.Simulation.cfl,
+                Settings.Simulation.domain,
+                Settings.Simulation.N_gridpoints,
+                Settings.Simulation.T_end)
+
+
+def create_measurer():
+    return Measurer(Settings.Measurement.points,
+                    Settings.Measurement.interval,
+                    Settings.Simulation.get_xvals())
+
+
+def create_mcmc_sampler():
+    # Proposer
+    prior = Settings.Prior.get_distribution()
+    # proposer = ConstSteppCNProposer(Settings.Sampling.step, prior)
+    # proposer = ConstStepStandardRWProposer(Settings.Sampling.step, prior)
+    proposer = VarStepStandardRWProposer(Settings.Sampling.step, prior)
+
+    # Accepter
+    integrator = create_integrator()
+    measurer = create_measurer()
+
+    IC_true = PerturbedRiemannIC(Settings.Simulation.IC.ground_truth)
+    
+    observation_operator = FVMObservationOperator(PerturbedRiemannIC,
+                                                  Settings.Prior.mean,
+                                                  integrator,
+                                                  measurer)
+
+    # ground_truth = measurer(integrator(IC_true, flux_true,flux_prime_true))
+    # compute the ground truth on a very fine grid
+    old_N_gridpoints = Settings.Simulation.N_gridpoints
+    Settings.Simulation.N_gridpoints = 1024
+    ground_truth = create_measurer()(create_integrator()(IC_true))
+    # print(ground_truth)
+    Settings.Simulation.N_gridpoints = old_N_gridpoints
+    
+    
+
+    noise = Settings.Noise.get_distribution()
+    potential = EvolutionPotential(observation_operator,
+                                   ground_truth,
+                                   noise)
+    # accepter = CountedAccepter(pCNAccepter(potential))
+    accepter = ConstrainAccepter(CountedAccepter(StandardRWAccepter(potential, prior)), is_valid_IC)
+
+    return MCMCSampler(proposer, accepter)
+
+
+def run_MCMC():
+    rng = [Settings.Sampling.rng]
+
+    sampler = create_mcmc_sampler()
+    chain_start = partial(sampler.run,
+                          Settings.Sampling.u_0,
+                          Settings.Sampling.N,
+                          Settings.Sampling.burn_in,
+                          Settings.Sampling.sample_interval)
+
+    ensemble_manager = EnsembleManager(DATA_DIR,
+                                       f"{Settings.filename()}")
+
+    ensemble = ensemble_manager.compute(chain_start, rng, 1)
+
+    for i in range(Settings.Sampling.N):
+        ensemble[0, :, i] += Settings.Prior.mean
+
+    # plt.plot(autocorrelation(ensemble[0, :, :], 50).transpose())
+    # plt.show()
+
+    show_ensemble(ensemble)
+
+
+def create_data(ensemble_size,
+                varied_quantity_setter,
+                varied_quantity_getter,
+                varied_quantity_values):
+    """Create an ensemble with the specified varied quantities
+    ensemble_size: int
+    varied_quantity_setter: callable
+        Provides access to the global Settings and is used the change the
+        varied_quantity in a way that the create_mcmc_sampler works correctly
+        (i.e. sees the updated values)
+    varied_quantity_getter: callable
+        Gives access to the varied quantity, used so that the state of the
+        Settings can be restored
+    varied_quantity_values: list
+        List elements are arguments to varied_quantity_setter
+    """
+    # Change the global Settings variable, not the local one in function scope
+    original_value = varied_quantity_getter()
+
+    # need at least one rng for the reference
+    rngs = [np.random.default_rng(i) for i in range(ensemble_size)]
+
+    # Compute chains
+    ensembles = []
+    for val in varied_quantity_values:
+        varied_quantity_setter(val)
+        sampler = create_mcmc_sampler()
+        chain_start = partial(sampler.run,
+                              Settings.Sampling.u_0,
+                              Settings.Sampling.N,
+                              Settings.Sampling.burn_in,
+                              Settings.Sampling.sample_interval)
+
+        ensemble_manager = EnsembleManager(DATA_DIR,
+                                           f"{Settings.filename()}_"
+                                           f"E={ensemble_size}")
+
+        ensemble = ensemble_manager.compute(chain_start,
+                                            rngs,
+                                            ensemble_size)
+
+        # Add prior mean
+        for j in range(ensemble_size):
+            for i in range(Settings.Sampling.N):
+                ensemble[j, :, i] += Settings.Prior.mean
+
+        ensembles.append(ensemble)
+
+    # reset varied quantity
+    varied_quantity_setter(original_value)
+
+    return ensembles
+
+
+def convergence(ensembles, reference, varied_quantity,
+                observable_function, distance_function,
+                plt_info, filename):
+    """Compute convergence of obsverable_function over varied_quantity of
+    ensembles towards reference, measured by distance_function.
+    ensembles: list(np.array((ensemble_size, u_dim, chain_length)))
+    reference: np.array((ensemble_size, u_dim, chain_length))
+    varied_quantity: list
+        len(varied_quantity) == len(ensembles)
+    observable_function: callable
+        Takes as argument one element of an ensemble (np.array((u_dim, chain_length)))
+        and returns a 1D np.array.
+    distance_function: callable
+        Takes as argument two return values from observable_function and returns a
+        the distance between them (a float).
+    plt_info: dict(str: str)
+        Dict containing:
+        title
+        xlabel (name of varied quantity)
+        ylabel (name of observable)
+    filename: string
+    """
+    n_ensembles = len(ensembles)
+    assert n_ensembles == len(varied_quantity), ""
+    ensemble_size = ensembles[0].shape[0]
+    for ensemble in ensembles:
+        assert ensemble_size == ensemble.shape[0], "Require equal-sized ensembles"
+
+    reference_observable = np.mean([observable_function(ref_chain) for ref_chain in reference],
+                                   axis=0)
+
+    distances = np.zeros((n_ensembles, ensemble_size))
+
+    for j, ensemble in enumerate(ensembles):
+        ensemble_observables = np.empty((ensemble_size,
+                                         *reference_observable.shape))
+        for i in range(ensemble_size):
+            ensemble_observables[i, :] = observable_function(ensemble[i, :])
+
+        for i in range(ensemble_size):
+            distances[j, i] = distance_function(ensemble_observables[i, :],
+                                                reference_observable)
+
+    means = np.array([np.mean(distances[j, :]) for j in range(n_ensembles)])
+    l_quartile = np.array([np.quantile(distances[j, :], 0.25) for j in range(n_ensembles)])
+    u_quartile = np.array([np.quantile(distances[j, :], 0.75) for j in range(n_ensembles)])
+
+    # Matplotlib plot
+    plt.errorbar(x=varied_quantity,
+                 y=means,
+                 yerr=np.array([means - l_quartile, u_quartile - means]),
+                 capsize=5)
+    plt.plot(varied_quantity, [np.sqrt(varied_quantity[0]) * means[0] / np.sqrt(a)
+                               for a in varied_quantity], '--', label="O(L^(-1/2))")
+    plt.title(plt_info["title"])
+    plt.xlabel(plt_info["xlabel"])
+    plt.xscale("log")
+    plt.ylabel(plt_info["ylabel"])
+    store_figure(f"{filename}_convergence_{plt_info['ylabel']}_{plt_info['xlabel']}"
+                 .replace('$', '').replace(' ', '_'))
+    # $ can occur from latex in labels and gives trouble for bash-operations
+
+    # Export to tikz format
+    name = plt_info["title"].replace('$', '').replace(' ', '_')
+    export_to_tikz_array(name + "_means", varied_quantity, means)
+    export_to_tikz_array(name + "_lquartile", varied_quantity, l_quartile)
+    export_to_tikz_array(name + "_uquartile", varied_quantity, u_quartile)
+
+
+class WassersteinDistanceComputer:
+    def __init__(self, ensembles, n_bins):
+        # determine range of u
+        self.u_range = np.array([np.min([np.min(ensemble) for ensemble in ensembles]),
+                                 np.max([np.max(ensemble) for ensemble in ensembles])])
+        self.n_bins = n_bins
+
+    def create_histogram(self, chain):
+        assert np.all(chain >= self.u_range[0]), ("Value(s) of this chain are outside the "
+                                                  "precomputed range")
+        assert np.all(chain <= self.u_range[1]), ("Value(s) of this chain are outside the "
+                                                  "precomputed range")
+
+        ensemble_binned = np.histogram(chain,
+                                       bins=self.n_bins,
+                                       range=self.u_range,
+                                       density=False)[0]
+        # hand-made normalization
+        ensemble_binned = ensemble_binned / np.sum(ensemble_binned)
+
+        return ensemble_binned
+
+    def compute_distance(self, hist1, hist2):
+        return wasserstein_distance(hist1, hist2, self.u_range.reshape(1, 2))
+
+
+def show_ensemble(ensemble):
+    """Plz write docstring"""
+
+    title = f"Chain length: {ensemble.shape[2]}, ensemble members: {ensemble.shape[0]}"
+    for k in range(ensemble.shape[0] - 1):
+        for i in range(2):
+            plt.plot(ensemble[k, i, :])
+
+    for i in range(len(Settings.Simulation.IC.names)):
+        plt.plot(ensemble[-1, i, :], label=Settings.Simulation.IC.names[i])
+
+    for p in Settings.Measurement.points:
+        l = p - Settings.Measurement.interval / 2
+        r = p + Settings.Measurement.interval / 2
+        plt.axhspan(l, r, facecolor='r', alpha=0.3)
+
+    # shock_locs = np.zeros_like(ensemble[0, 0, :])
+    # rarefactions = []
+    # for i in range(len(shock_locs)):
+    #     try:
+    #         shock_locs[i] = BurgersEquation.riemann_shock_pos(ensemble[0, 0, i] + 1,
+    #                                                           ensemble[0, 1, i],
+    #                                                           ensemble[0, 2, i],
+    #                                                           1)
+    #     except AssertionError:
+    #         rarefactions += [i]
+    # plt.plot(shock_locs, color='r')
+    # if rarefactions:
+    #     print(f"{len(rarefactions)} rarefactions during sampling")
+    #     for i in rarefactions:
+    #         plt.axvline(i, color='r', alpha=0.05)
+
+    plt.legend()
+    plt.title(title)
+    plt.show()
+
+    # densities
+    intervals = [(-0.5, 0.5)] * 2
+    priors = [norm(loc=mu, scale=Settings.Prior.std_dev)
+              for mu in Settings.Prior.mean]
+    fig, plts = plt.subplots(1, 2, figsize=(20, 10))
+
+    plot_info = list(zip(intervals,
+                         Settings.Simulation.IC.ground_truth,
+                         Settings.Simulation.IC.names,
+                         priors,
+                         plts))
+
+    for k in range(ensemble.shape[0] - 1):
+        for i, (interval, _, __, ___, ax) in enumerate(plot_info):
+            x_range = np.linspace(*interval, num=500)
+            ax.hist(ensemble[k, i, :], density=True, alpha=0.5)
+
+    for i, (interval, true_val, name, prior, ax) in enumerate(plot_info):
+        x_range = np.linspace(*interval, num=500)
+        ax.plot(x_range, [prior.pdf(x) for x in x_range])
+        ax.hist(ensemble[-1, i, :], density=True, color='b', alpha=0.5)
+        ax.axvline(true_val, c='r')
+        ax.set_title(f"Posterior for {name}")
+        ax.set(xlabel=name, ylabel="Probability")
+
+    plt.show()
+
+
+# These setters are required to be able to give the create_data
+# the varied quantity as argument and change the global value
+def sample_N_change(new_N):
+    global Settings
+    Settings.Sampling.N = new_N
+
+
+def sample_N_get():
+    return Settings.Sampling.N
+
+
+def grid_N_change(new_N):
+    global Settings
+    Settings.Simulation.N_gridpoints = new_N
+
+
+def grid_N_get():
+    return Settings.Simulation.N_gridpoints
+
+
+def wasserstein_convergence_chainlength():
+    ensemble_size = 30
+    chain_lengths = [250, 500, 1000, 2000, 4000]
+    ensembles = create_data(ensemble_size,
+                            sample_N_change,
+                            sample_N_get,
+                            chain_lengths)
+
+    # export posterior to tikz
+    # hist_export_to_tikz_array("hist_delta_1_N=2000", ensembles[-1][0,0,:])
+    # hist_export_to_tikz_array("hist_delta_2_N=2000", ensembles[-1][0,1,:])
+    # hist_export_to_tikz_array("hist_sigma_0_N=2000", ensembles[-1][0,2,:])
+
+    wasserstein_plot_info = {"xlabel": "Length of the chain",
+                             "ylabel": "$W_1$"}
+    for i, name in enumerate(Settings.Simulation.IC.names):
+        wasserstein_plot_info["title"] = f"$W_1$ for different chain lengths for {name}"
+        # extract 1 dim of u from ensembles
+        one_var_ensembles = [ensemble[:, i, :].reshape(ensemble_size,
+                                                       1,
+                                                       chain_length)
+                             for ensemble, chain_length in zip(ensembles, chain_lengths)]
+        n_bins = 100
+        wasserstein = WassersteinDistanceComputer(one_var_ensembles, n_bins)
+        convergence(ensembles=one_var_ensembles[:-1],
+                    reference=one_var_ensembles[-1],
+                    varied_quantity=chain_lengths[:-1],
+                    observable_function=wasserstein.create_histogram,
+                    distance_function=wasserstein.compute_distance,
+                    plt_info=wasserstein_plot_info,
+                    filename=f"{Settings.filename()}_{name}")
+
+
+def wasserstein_convergence_grid():
+    ensemble_size = 30
+    grid_sizes = [16, 32, 64, 128, 256, 512]
+    ensembles = create_data(ensemble_size,
+                            grid_N_change,
+                            grid_N_get,
+                            grid_sizes)
+
+    # show_ensemble(ensembles[0])
+    for e in ensembles:
+        show_ensemble(e)
+
+    # print(autocorrelation(ensembles[0][0,:,:],40))
+
+
+
+    # export posterior to tikz
+    # hist_export_to_tikz_array("hist_discontinuousflux_delta_h=128", ensembles[-1][0,0,:])
+    # hist_export_to_tikz_array("hist_discontinuousflux_a_h=128", ensembles[-1][0,1,:])
+    # hist_export_to_tikz_array("hist_sigma_0_h=128", ensembles[-1][0,2,:])
+    # mean_MAP_plot("discontinuous_flux_h=128", ensembles[-1][0,:,:])
+
+    # wasserstein_plot_info = {"xlabel": "Number of gridpoints",
+    #                          "ylabel": "$W_1$"}
+
+    # for i, name in enumerate(Settings.Simulation.IC.names):
+    #     wasserstein_plot_info["title"] = f"$W_1$ for different grid spacings for {name}"
+    #     # extract 1 dim of u from ensembles
+    #     one_var_ensembles = [ensemble[:, i, :].reshape(ensemble_size,
+    #                                                    1,
+    #                                                    Settings.Sampling.N)
+    #                          for ensemble in ensembles]
+    #     n_bins = 100
+    #     wasserstein = WassersteinDistanceComputer(one_var_ensembles, n_bins)
+    #     convergence(ensembles=one_var_ensembles[:-1],
+    #                 reference=one_var_ensembles[-1],
+    #                 varied_quantity=grid_sizes[:-1],
+    #                 observable_function=wasserstein.create_histogram,
+    #                 distance_function=wasserstein.compute_distance,
+    #                 plt_info=wasserstein_plot_info,
+    #                 filename=f"{Settings.filename()}_{name}")
+
+
+def convergence_scalar_function_grid(function, name):
+    """Convergence over scalar function of the posterior"""
+    ensemble_size = 30
+    grid_sizes = [32, 64, 128]
+    ensembles = create_data(ensemble_size,
+                            grid_N_change,
+                            grid_N_get,
+                            grid_sizes)
+
+    plot_info = {"title": f"Posterior {name} for different grid spacings",
+                 "xlabel": "Number of gridpoints",
+                 "ylabel": f"{name}"}
+    for i, name in enumerate(Settings.Simulation.IC.names):
+        # extract 1 dim of u from ensembles
+        one_var_ensembles = [ensemble[:, i, :].reshape(ensemble_size,
+                                                       1,
+                                                       Settings.Sampling.N)
+                             for ensemble in ensembles]
+
+        convergence(ensembles=one_var_ensembles[:-1],
+                    reference=one_var_ensembles[-1],
+                    varied_quantity=grid_sizes[:-1],
+                    observable_function=lambda x: np.array([function(x)]),
+                    distance_function=lambda x, y: np.abs(x-y),
+                    plt_info=plot_info,
+                    filename=f"{Settings.filename()}_{name}")
+
+
+def convergence_scalar_function_chainlength(function, name):
+    """Convergence over scalar function of the posterior"""
+    ensemble_size = 30
+    chain_lengths = [250, 500, 1000, 2000]
+    ensembles = create_data(ensemble_size,
+                            sample_N_change,
+                            sample_N_get,
+                            chain_lengths)
+
+    plot_info = {"title": f"Posterior {name} for different chain lengths",
+                 "xlabel": "Length of the chain",
+                 "ylabel": f"{name}"}
+    for i, name in enumerate(Settings.Simulation.IC.names):
+        # extract 1 dim of u from ensembles
+        one_var_ensembles = [ensemble[:, i, :].reshape(ensemble_size,
+                                                       1,
+                                                       chain_length)
+                             for ensemble, chain_length in zip(ensembles, chain_lengths)]
+
+        convergence(ensembles=one_var_ensembles[:-1],
+                    reference=one_var_ensembles[-1],
+                    varied_quantity=chain_lengths[:-1],
+                    observable_function=lambda x: np.array([function(x)]),
+                    distance_function=lambda x, y: np.abs(x-y),
+                    plt_info=plot_info,
+                    filename=f"{Settings.filename()}_{name}")
+
+
+if __name__ == '__main__':
+    run_MCMC()
+    # Settings.Sampling.N = 2500
+    # wasserstein_convergence_grid()
+    # Settings.Sampling.N = 5000
+    # wasserstein_convergence_chainlength()
+    # convergence_scalar_function_chainlength(np.mean, "mean")
+    # convergence_scalar_function_chainlength(np.var, "variance")
