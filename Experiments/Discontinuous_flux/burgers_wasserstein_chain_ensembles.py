@@ -165,9 +165,9 @@ class Settings:
     class Sampling:
         step = PWLinear(0.05, 0.001, 250)
         u_0 = np.zeros(2)
-        N = 25
-        burn_in = 5
-        sample_interval = 2
+        N = 2500
+        burn_in = 500
+        sample_interval = 20
         rng = np.random.default_rng(2)
 
     @staticmethod
